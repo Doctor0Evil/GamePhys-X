@@ -1,0 +1,678 @@
+// ============================================================================
+// GRAPHICS OUTPUT MODULE
+// Sanitized, production-ready reconstruction of the provided BlitzMax
+// GraphicsOutput type, designed for:
+//   - 192x24 source sprite strips
+//   - Per-limb, per-frame bent-limb preview
+//   - Frame grabbing and cropping for export
+//   - Integration with neuromorphic/BCI pipelines via a clean C++-style API
+// ============================================================================
+
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <string>
+#include <memory>
+#include <algorithm>
+
+namespace NeuroSprite
+{
+    // ------------------------------------------------------------------------
+    // Basic vector
+    // ------------------------------------------------------------------------
+    struct Vec2i
+    {
+        int x;
+        int y;
+        Vec2i() : x(0), y(0) {}
+        Vec2i(int x_, int y_) : x(x_), y(y_) {}
+    };
+
+    // ------------------------------------------------------------------------
+    // Pixmap abstraction (matches the FileIO module’s Pixmap shape)
+    // ------------------------------------------------------------------------
+    struct Pixmap
+    {
+        uint32_t width  = 0;
+        uint32_t height = 0;
+        uint32_t strideBytes = 0;
+        uint8_t* data   = nullptr;  // RGBA8888
+
+        bool isValid() const
+        {
+            return data != nullptr && width > 0 && height > 0;
+        }
+    };
+
+    // ------------------------------------------------------------------------
+    // Minimal LimbManager interface expected by GraphicsOutput
+    // (You bind this to your engine’s actual limb manager / skeleton system.)
+    // ------------------------------------------------------------------------
+    class ILimbManager
+    {
+    public:
+        virtual ~ILimbManager() = default;
+
+        virtual void CreateLimbParts(int inputZoom, int tileSize) = 0;
+        virtual void SetJointMarker(const Vec2i& mousePos) = 0;
+        virtual void DrawBentLimbs(const Vec2i& origin,
+                                   int frameCount,
+                                   const std::vector<int>& bentLimbPartDrawOrder) = 0;
+        virtual void DrawTileOutlines() = 0;
+        virtual void DrawJointMarkers() = 0;
+    };
+
+    // ------------------------------------------------------------------------
+    // Utility API (engine-dependent implementations in your bindings)
+    // ------------------------------------------------------------------------
+    namespace Utility
+    {
+        inline int Clamp(int v, int minV, int maxV)
+        {
+            return std::max(minV, std::min(maxV, v));
+        }
+
+        // Implement these in your engine layer:
+        bool PointIsWithinBox(const Vec2i& p,
+                              const Vec2i& boxMin,
+                              const Vec2i& boxSize);
+
+        void DrawTextWithShadow(const std::string& text,
+                                const Vec2i& pos,
+                                const int rgb[3]);
+
+        void ResetDrawColor();
+
+        // Image helpers used for frame cropping:
+        Pixmap RotatePixmap(const Pixmap& src, int angleDegrees);
+        Pixmap XFlipPixmap(const Pixmap& src);
+        int*   GetPixmapNonMaskedPixelBounds(const Pixmap& src, int magentaARGB);
+    }
+
+    // ------------------------------------------------------------------------
+    // Low-level drawing functions that must be bound to the engine:
+    // ------------------------------------------------------------------------
+    namespace Gfx
+    {
+        void SetClsColor(int r, int g, int b);
+        void SetMaskColor(int r, int g, int b);
+        void SetColor(int r, int g, int b);
+
+        void Cls();
+        void Flip(int vsync);
+
+        int  GraphicsWidth();
+        int  TextWidth(const std::string& s);
+        int  TextHeight(const std::string& s);
+
+        void SetScale(float sx, float sy);
+
+        void DrawRect(int x, int y, int w, int h);
+        void DrawRectOutline(const Vec2i& pos, const Vec2i& size, const int rgb[3]);
+
+        void DrawImageRect(void* imageHandle,
+                           int dstX, int dstY,
+                           int dstW, int dstH);
+
+        void DrawImage(void* imageHandle, int x, int y);
+
+        void SetImageHandle(void* imageHandle, int hx, int hy);
+
+        void* CreateImage(int w, int h, int frames, uint32_t flags);
+        void  GrabImage(void* imageHandle, int srcX, int srcY);
+
+        Pixmap GrabPixmap(int x, int y, int w, int h);
+
+        uint32_t ReadPixel(const Pixmap& src, int x, int y);
+        void     WritePixel(Pixmap& dst, int x, int y, uint32_t argb);
+
+        Pixmap   CreatePixmap(int w, int h, uint32_t pixelFormat);
+
+        void* LoadImageFromPixmap(const Pixmap& src, uint32_t flags);
+        Pixmap MaskPixmap(const Pixmap& src, int mr, int mg, int mb);
+
+        int  MouseX();
+        int  MouseY();
+        int  MouseXSpeed();
+        int  MouseYSpeed();
+        bool MouseDown(int button);
+
+        void Notify(const std::string& msg, bool isError);
+    }
+
+    // ------------------------------------------------------------------------
+    // Constants (tune as needed)
+    // ------------------------------------------------------------------------
+    static constexpr int C_LIMB_COUNT    = 4;   // ArmFG, ArmBG, LegFG, LegBG
+    static constexpr int C_MAX_FRAME_COUNT = 64;
+
+    // ------------------------------------------------------------------------
+    // GraphicsOutput: sanitized, engine-agnostic port
+    // ------------------------------------------------------------------------
+    class GraphicsOutput
+    {
+    public:
+        GraphicsOutput(int maxWorkspaceWidth,
+                       const Vec2i& canvasVisibleArea,
+                       ILimbManager* limbManager,
+                       int defaultInputZoom,
+                       int defaultOutputZoom,
+                       int defaultFrameCount,
+                       int defaultBackgroundR,
+                       int defaultBackgroundG,
+                       int defaultBackgroundB)
+        : m_CanvasVisibleArea(canvasVisibleArea)
+        , m_SourceImage(nullptr)
+        , m_SourceImageSize(0, 0)
+        , m_MaxInputZoom(std::max(1, maxWorkspaceWidth / 192))
+        , m_InputZoom(defaultInputZoom)
+        , m_OutputZoom(defaultOutputZoom)
+        , m_TileSize(24 * defaultInputZoom)
+        , m_FrameCount(defaultFrameCount)
+        , m_DrawOutputFrameBounds(false)
+        , m_OutputPanOffsetX(0)
+        , m_OutputPanOffsetY(0)
+        , m_LimbManager(limbManager)
+        {
+            m_BackgroundColor[0] = defaultBackgroundR;
+            m_BackgroundColor[1] = defaultBackgroundG;
+            m_BackgroundColor[2] = defaultBackgroundB;
+
+            m_Magenta[0] = 255;
+            m_Magenta[1] = 0;
+            m_Magenta[2] = 255;
+
+            Gfx::SetClsColor(m_BackgroundColor[0],
+                             m_BackgroundColor[1],
+                             m_BackgroundColor[2]);
+            Gfx::SetMaskColor(m_Magenta[0], m_Magenta[1], m_Magenta[2]);
+
+            std::fill(&m_FrameBoundingBoxPosX[0][0],
+                      &m_FrameBoundingBoxPosX[0][0] + C_LIMB_COUNT * C_MAX_FRAME_COUNT,
+                      0);
+            std::fill(&m_FrameBoundingBoxPosY[0][0],
+                      &m_FrameBoundingBoxPosY[0][0] + C_LIMB_COUNT * C_MAX_FRAME_COUNT,
+                      0);
+
+            m_BentLimbPartDrawOrder.assign(C_LIMB_COUNT, 0);
+
+            if (m_LimbManager)
+            {
+                m_LimbManager->CreateLimbParts(m_InputZoom, m_TileSize);
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Load 192x24 source sprite strip
+        // engineImageHandle is engine-specific (e.g., Godot Image*, Unreal UTexture2D*)
+        // width/height are validated.
+        // --------------------------------------------------------------------
+        bool LoadFile(void* engineImageHandle, int width, int height)
+        {
+            if (!engineImageHandle)
+                return false;
+
+            if (width == 192 && height == 24)
+            {
+                m_SourceImage     = engineImageHandle;
+                m_SourceImageSize = Vec2i(width, height);
+
+                Gfx::DrawImageRect(m_SourceImage,
+                                   0, 0,
+                                   m_SourceImageSize.x * m_InputZoom,
+                                   m_SourceImageSize.y * m_InputZoom);
+
+                if (m_LimbManager)
+                {
+                    m_LimbManager->CreateLimbParts(m_InputZoom, m_TileSize);
+                }
+                return true;
+            }
+
+            Gfx::Notify(
+                "Attempting to load image with incorrect dimensions. "
+                "Expected 192x24 pixels.",
+                true);
+            return false;
+        }
+
+        void SetCanvasVisibleArea(const Vec2i& visibleArea)
+        {
+            m_CanvasVisibleArea = visibleArea;
+        }
+
+        int SetBackgroundColor(const int rgbValue[3])
+        {
+            m_BackgroundColor[0] = Utility::Clamp(rgbValue[0], 0, 255);
+            m_BackgroundColor[1] = Utility::Clamp(rgbValue[1], 0, 255);
+            m_BackgroundColor[2] = Utility::Clamp(rgbValue[2], 0, 255);
+            ChangeBackgroundColor(m_BackgroundColor);
+            return 0;
+        }
+
+        void ChangeBackgroundColor(const int rgbValue[3])
+        {
+            Gfx::SetClsColor(rgbValue[0], rgbValue[1], rgbValue[2]);
+        }
+
+        void RevertBackgroundColorAfterSave(bool revertOrNot)
+        {
+            if (revertOrNot)
+                ChangeBackgroundColor(m_BackgroundColor);
+        }
+
+        int SetInputZoom(int newZoom)
+        {
+            int clamped = Utility::Clamp(newZoom, 1, m_MaxInputZoom);
+            if (m_InputZoom != clamped)
+            {
+                m_InputZoom = clamped;
+                m_TileSize  = 24 * m_InputZoom;
+
+                if (m_SourceImage)
+                {
+                    Gfx::DrawImageRect(m_SourceImage,
+                                       0, 0,
+                                       m_SourceImageSize.x * m_InputZoom,
+                                       m_SourceImageSize.y * m_InputZoom);
+                    if (m_LimbManager)
+                        m_LimbManager->CreateLimbParts(m_InputZoom, m_TileSize);
+                }
+            }
+            return m_InputZoom;
+        }
+
+        int SetOutputZoom(int newZoom)
+        {
+            m_OutputZoom      = Utility::Clamp(newZoom, 1, 5);
+            m_OutputPanOffsetX = 0;
+            m_OutputPanOffsetY = 0;
+            return m_OutputZoom;
+        }
+
+        int GetFrameCount() const
+        {
+            return m_FrameCount;
+        }
+
+        int SetFrameCount(int newCount)
+        {
+            m_FrameCount = Utility::Clamp(newCount, 1, C_MAX_FRAME_COUNT);
+            return m_FrameCount;
+        }
+
+        int SetDrawOutputFrameBounds(bool drawOrNot)
+        {
+            m_DrawOutputFrameBounds = drawOrNot;
+            return m_DrawOutputFrameBounds ? 1 : 0;
+        }
+
+        void SetBentLimbPartDrawOrder(const std::vector<int>& drawOrder)
+        {
+            m_BentLimbPartDrawOrder = drawOrder;
+            if (m_BentLimbPartDrawOrder.size() < C_LIMB_COUNT)
+                m_BentLimbPartDrawOrder.resize(C_LIMB_COUNT, 0);
+        }
+
+        void SetOutputPanOffset(const Vec2i& mouseMovement)
+        {
+            m_OutputPanOffsetX -= mouseMovement.x;
+            m_OutputPanOffsetX = Utility::Clamp(
+                m_OutputPanOffsetX,
+                0,
+                100 + (m_FrameCount * ((m_TileSize / m_InputZoom) + 8)) * m_OutputZoom);
+
+            m_OutputPanOffsetY -= mouseMovement.y;
+            m_OutputPanOffsetY = Utility::Clamp(
+                m_OutputPanOffsetY,
+                0,
+                150 * m_OutputZoom);
+        }
+
+        // --------------------------------------------------------------------
+        // Grab full output strip for saving
+        // --------------------------------------------------------------------
+        Pixmap GrabOutputForSaving()
+        {
+            if (!m_SourceImage)
+            {
+                Gfx::Notify("Nothing to save.", false);
+                return Pixmap{};
+            }
+
+            ChangeBackgroundToMagentaForSave();
+            Draw(true);
+            Gfx::Flip(1);
+
+            int w = 100 + (m_FrameCount * ((m_TileSize / m_InputZoom) + 8));
+            Pixmap px = Gfx::GrabPixmap(
+                0,
+                12 + (m_SourceImageSize.y * m_InputZoom),
+                w,
+                200);
+            return px;
+        }
+
+        // --------------------------------------------------------------------
+        // Grab frames [limb][frame] for saving; fully cropped around content
+        // --------------------------------------------------------------------
+        std::vector<std::vector<Pixmap>> GrabOutputFramesForSaving()
+        {
+            std::vector<std::vector<Pixmap>> result;
+
+            if (!m_SourceImage)
+            {
+                Gfx::Notify("Nothing to save.", false);
+                return result;
+            }
+
+            ChangeBackgroundToMagentaForSave();
+            Draw(true);
+            Gfx::Flip(1);
+
+            result.resize(C_LIMB_COUNT);
+            for (int limb = 0; limb < C_LIMB_COUNT; ++limb)
+            {
+                result[limb].resize(m_FrameCount);
+
+                int rotationAngle = (limb >= 2) ? 90 : -90;
+
+                for (int frame = 0; frame < m_FrameCount; ++frame)
+                {
+                    int grabX = m_FrameBoundingBoxPosX[limb][frame] + 1;
+                    int grabY = m_FrameBoundingBoxPosY[limb][frame] + 1;
+                    int grabW = m_FrameBoundingBoxSize.x - 1;
+                    int grabH = m_FrameBoundingBoxSize.y - 1;
+
+                    Pixmap raw = Gfx::GrabPixmap(grabX, grabY, grabW, grabH);
+                    Pixmap rotated = Utility::RotatePixmap(raw, rotationAngle);
+                    if (limb >= 2)
+                        rotated = Utility::XFlipPixmap(rotated);
+
+                    result[limb][frame] = rotated;
+                }
+            }
+
+            return CropGrabbedOutputFrames(result);
+        }
+
+        // --------------------------------------------------------------------
+        // Update: mouse interaction and limb marker setting
+        // --------------------------------------------------------------------
+        void Update()
+        {
+            if (!m_SourceImage)
+                return;
+
+            Vec2i mouseMovement(Gfx::MouseXSpeed(), Gfx::MouseYSpeed());
+            if (Gfx::MouseDown(1))
+            {
+                Vec2i mousePos(Gfx::MouseX(), Gfx::MouseY());
+                if (Utility::PointIsWithinBox(
+                        mousePos,
+                        Vec2i(0, 0),
+                        Vec2i(m_SourceImageSize.x * m_InputZoom,
+                              m_SourceImageSize.y * m_InputZoom)))
+                {
+                    if (m_LimbManager)
+                        m_LimbManager->SetJointMarker(mousePos);
+                }
+                else
+                {
+                    SetOutputPanOffset(mouseMovement);
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Draw when no image is loaded
+        // --------------------------------------------------------------------
+        void DrawNoSourceImageScreen()
+        {
+            Gfx::Cls();
+            Gfx::SetScale(2.0f, 2.0f);
+
+            std::string text = "NO IMAGE LOADED!";
+            int drawColor[3] = {255, 230, 80};
+
+            int x = (m_CanvasVisibleArea.x / 2) - Gfx::TextWidth(text);
+            int y = (m_CanvasVisibleArea.y / 2) - Gfx::TextHeight(text);
+
+            Utility::DrawTextWithShadow(text, Vec2i(x, y), drawColor);
+            Gfx::SetScale(1.0f, 1.0f);
+            Gfx::Flip(1);
+        }
+
+        // --------------------------------------------------------------------
+        // Draw zoomed output copy
+        // --------------------------------------------------------------------
+        void DrawZoomedOutput()
+        {
+            Vec2i outputUnzoomedSize(
+                100 + (m_FrameCount * ((m_TileSize / m_InputZoom) + 8)),
+                230);
+
+            void* outputCopy = Gfx::CreateImage(
+                outputUnzoomedSize.x,
+                outputUnzoomedSize.y,
+                1,
+                /*DYNAMICIMAGE*/ 1);
+
+            Gfx::GrabImage(outputCopy,
+                           0,
+                           m_SourceImageSize.y * m_InputZoom);
+
+            Gfx::SetColor(m_BackgroundColor[0],
+                          m_BackgroundColor[1],
+                          m_BackgroundColor[2]);
+            Gfx::DrawRect(
+                0,
+                m_SourceImageSize.y * m_InputZoom,
+                outputUnzoomedSize.x + 20,
+                outputUnzoomedSize.y + 20);
+            Utility::ResetDrawColor();
+
+            Gfx::SetImageHandle(outputCopy,
+                                m_OutputPanOffsetX,
+                                m_OutputPanOffsetY);
+
+            Gfx::DrawImageRect(
+                outputCopy,
+                0,
+                m_SourceImageSize.y * m_InputZoom,
+                outputUnzoomedSize.x * m_OutputZoom,
+                outputUnzoomedSize.y * m_OutputZoom);
+        }
+
+        // --------------------------------------------------------------------
+        // Main draw
+        // --------------------------------------------------------------------
+        void Draw(bool disableOutputZoom = false)
+        {
+            if (!m_SourceImage)
+            {
+                DrawNoSourceImageScreen();
+                return;
+            }
+
+            Gfx::Cls();
+
+            int vertOffsetFromSource = (m_SourceImageSize.y * m_InputZoom) + 34;
+            if (m_LimbManager)
+            {
+                m_LimbManager->DrawBentLimbs(
+                    Vec2i(100, vertOffsetFromSource),
+                    m_FrameCount,
+                    m_BentLimbPartDrawOrder);
+            }
+
+            int labelColor[3] = {255, 230, 80};
+            Utility::DrawTextWithShadow("Arm FG", Vec2i(10, vertOffsetFromSource), labelColor);
+            Utility::DrawTextWithShadow("Arm BG", Vec2i(10, vertOffsetFromSource + 48), labelColor);
+            Utility::DrawTextWithShadow("Leg FG", Vec2i(10, vertOffsetFromSource + 96), labelColor);
+            Utility::DrawTextWithShadow("Leg BG", Vec2i(10, vertOffsetFromSource + 144), labelColor);
+
+            if (m_DrawOutputFrameBounds)
+            {
+                int boxColor[3] = {0, 0, 80};
+                m_FrameBoundingBoxSize = Vec2i(32, 48);
+
+                for (int row = 0; row < C_LIMB_COUNT; ++row)
+                {
+                    for (int frame = 0; frame < m_FrameCount; ++frame)
+                    {
+                        int posX = 100 - 20 + (frame * ((m_TileSize / m_InputZoom) + 8));
+                        int posY = vertOffsetFromSource - 12 + (row * 48);
+
+                        m_FrameBoundingBoxPosX[row][frame] = posX;
+                        m_FrameBoundingBoxPosY[row][frame] = posY;
+
+                        Gfx::DrawRectOutline(Vec2i(posX, posY),
+                                             m_FrameBoundingBoxSize,
+                                             boxColor);
+                    }
+                }
+            }
+
+            if (!disableOutputZoom && m_OutputZoom > 1)
+                DrawZoomedOutput();
+
+            Gfx::SetColor(m_Magenta[0], m_Magenta[1], m_Magenta[2]);
+            Gfx::DrawRect(0,
+                          0,
+                          Gfx::GraphicsWidth(),
+                          (m_SourceImageSize.y * m_InputZoom) + 1);
+
+            Utility::ResetDrawColor();
+            Gfx::DrawImageRect(
+                m_SourceImage,
+                0,
+                0,
+                m_SourceImageSize.x * m_InputZoom,
+                m_SourceImageSize.y * m_InputZoom);
+
+            if (m_LimbManager)
+            {
+                m_LimbManager->DrawTileOutlines();
+                m_LimbManager->DrawJointMarkers();
+            }
+
+            Gfx::Flip(1);
+        }
+
+    private:
+        Vec2i m_CanvasVisibleArea;
+
+        void* m_SourceImage;
+        Vec2i m_SourceImageSize;
+
+        int m_BackgroundColor[3];
+        int m_Magenta[3];
+
+        int m_MaxInputZoom;
+        int m_InputZoom;
+        int m_OutputZoom;
+        int m_TileSize;
+        int m_FrameCount;
+
+        bool m_DrawOutputFrameBounds;
+        int  m_FrameBoundingBoxPosX[C_LIMB_COUNT][C_MAX_FRAME_COUNT];
+        int  m_FrameBoundingBoxPosY[C_LIMB_COUNT][C_MAX_FRAME_COUNT];
+        Vec2i m_FrameBoundingBoxSize;
+
+        int m_OutputPanOffsetX;
+        int m_OutputPanOffsetY;
+
+        std::vector<int> m_BentLimbPartDrawOrder;
+
+        ILimbManager* m_LimbManager;
+
+        // Helper: set magenta background before grabbing output
+        void ChangeBackgroundToMagentaForSave()
+        {
+            Gfx::SetClsColor(m_Magenta[0], m_Magenta[1], m_Magenta[2]);
+        }
+
+        // Cropping logic: stack frames, compute non-magenta bounds, crop all
+        std::vector<std::vector<Pixmap>> CropGrabbedOutputFrames(
+            const std::vector<std::vector<Pixmap>>& framesToCrop)
+        {
+            std::vector<std::vector<Pixmap>> cropped;
+            cropped.resize(C_LIMB_COUNT);
+            if (framesToCrop.empty() ||
+                framesToCrop[0].empty() ||
+                !framesToCrop[0][0].isValid())
+            {
+                return cropped;
+            }
+
+            Pixmap stackedLimbFrames = Gfx::CreatePixmap(
+                framesToCrop[0][0].width,
+                framesToCrop[0][0].height,
+                /*PF_RGBA8888*/ 0);
+
+            for (int limb = 0; limb < C_LIMB_COUNT; ++limb)
+            {
+                cropped[limb].resize(m_FrameCount);
+
+                Gfx::Cls();
+
+                for (int frame = 0; frame < m_FrameCount; ++frame)
+                {
+                    Pixmap masked = Gfx::MaskPixmap(
+                        framesToCrop[limb][frame],
+                        m_Magenta[0],
+                        m_Magenta[1],
+                        m_Magenta[2]);
+
+                    void* maskedImg = Gfx::LoadImageFromPixmap(
+                        masked,
+                        /*DYNAMICIMAGE|MASKEDIMAGE*/ 3);
+                    Gfx::DrawImage(maskedImg, 0, 0);
+                    stackedLimbFrames = Gfx::GrabPixmap(
+                        0, 0,
+                        stackedLimbFrames.width,
+                        stackedLimbFrames.height);
+                }
+
+                int* bounds = Utility::GetPixmapNonMaskedPixelBounds(
+                    stackedLimbFrames,
+                    -65281); // magenta ARGB in this context
+
+                int minX = bounds[0];
+                int maxX = bounds[1];
+                int minY = bounds[2];
+                int maxY = bounds[3];
+
+                int cropW = maxX - minX + 1;
+                int cropH = maxY - minY + 1;
+
+                for (int frame = 0; frame < m_FrameCount; ++frame)
+                {
+                    Pixmap croppedFrame = Gfx::CreatePixmap(
+                        cropW,
+                        cropH,
+                        /*PF_RGBA8888*/ 0);
+
+                    int yCount = 0;
+                    for (int py = minY; py <= maxY; ++py)
+                    {
+                        int xCount = 0;
+                        for (int px = minX; px <= maxX; ++px)
+                        {
+                            uint32_t color = Gfx::ReadPixel(
+                                framesToCrop[limb][frame],
+                                px,
+                                py);
+                            Gfx::WritePixel(croppedFrame, xCount, yCount, color);
+                            ++xCount;
+                        }
+                        ++yCount;
+                    }
+                    cropped[limb][frame] = croppedFrame;
+                }
+            }
+            return cropped;
+        }
+    };
+}
